@@ -166,17 +166,19 @@ def order():
                  "pickup": "🏬 O'ZI OLIB KETADI: yukni rasxod qilib saqlab qo'ying"}.get(mode, "Usul tanlanmagan"))
     if not (u and u["phone"]):
         head.append("⚠️ Botda to'liq ro'yxatdan o'tmagan")
-    lines, last = list(head), None
+    groups = {}
     for s, col, n, qty, inote in items:
-        key = f"{s} · {col}" if col else str(s)
-        if key != last:
-            lines += ["", f"▪️ {key[:120]}"]
-            last = key
-        try:
-            qty = max(1, min(int(qty), 1000000))
-        except Exception:
-            qty = 1
-        lines.append(f"• {str(n)[:150]} — {qty} ta" + (f" (izoh: {str(inote)[:150]})" if inote else ""))
+        groups.setdefault(f"{s} · {col}" if col else str(s), []).append((n, qty, inote))
+    lines, k = list(head), 0
+    for key, its in groups.items():
+        lines += ["", f"▪️ {key[:120]}"]
+        for n, qty, inote in its:
+            k += 1
+            try:
+                qty = max(1, min(int(qty), 1000000))
+            except Exception:
+                qty = 1
+            lines.append(f"{k}) {str(n)[:150]} - {qty} ta" + (f" (izoh: {str(inote)[:150]})" if inote else ""))
     if note:
         lines += ["", f"💬 Izoh: {note}"]
     chunks, cur_txt = [], ""
