@@ -142,6 +142,26 @@ def verify_init(init_data):
     return None
 
 
+def roman(n):
+    out = ""
+    for v, s in [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"), (50, "L"),
+                 (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")]:
+        while n >= v:
+            out += s
+            n -= v
+    return out
+
+
+def roman(n):
+    out = ""
+    for v, s in ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"), (50, "L"),
+                 (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")):
+        while n >= v:
+            out += s
+            n -= v
+    return out
+
+
 @app.post("/api/order")
 def order():
     d = request.get_json(silent=True) or {}
@@ -169,11 +189,10 @@ def order():
     groups = {}
     for s, col, n, qty, inote in items:
         groups.setdefault(f"{s} · {col}" if col else str(s), []).append((n, qty, inote))
-    lines, k = list(head), 0
-    for key, its in groups.items():
-        lines += ["", f"▪️ {key[:120]}"]
-        for n, qty, inote in its:
-            k += 1
+    lines = list(head)
+    for g, (key, its) in enumerate(groups.items(), 1):
+        lines += ["", f"{roman(g)}. {key[:120]}"]
+        for k, (n, qty, inote) in enumerate(its, 1):
             try:
                 qty = max(1, min(int(qty), 1000000))
             except Exception:
