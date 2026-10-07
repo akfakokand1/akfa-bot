@@ -13,6 +13,10 @@ API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 DB = os.path.join(DATA_DIR, "akfa.db")
 
+# Buyurtmani qabul qiladigan menejerlar (tugmalarda shu ismlar chiqadi). Ismni o'zgartirish yoki qo'shish mumkin.
+MANAGERS = ["Ayubxon", "Bekzodjon", "Behzodbek", "Muhammadjon", "Umarxon", "Xolidjon"]
+OFFICE_PHONE = "+998 72 200 00 00"
+
 
 def db():
     c = sqlite3.connect(DB, timeout=15)
@@ -23,6 +27,10 @@ def db():
 with db() as _c:
     _c.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT, phone TEXT, step TEXT, username TEXT)")
     _c.execute("CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, status TEXT DEFAULT 'new', taken_by TEXT, created INTEGER)")
+    try:
+        _c.execute("ALTER TABLE orders ADD COLUMN mode TEXT")
+    except sqlite3.OperationalError:
+        pass
 
 
 def tg(method, **kw):
@@ -96,18 +104,27 @@ def on_callback(q):
         tg("sendMessage", chat_id=cid, text=f"{label} tanlandi. Katalogni oching, tovarlarni savatga yig'ing va buyurtmani yuboring:",
            reply_markup={"inline_keyboard": [[{"text": "📋 Katalogni ochish", "web_app": {"url": f"{SITE_URL}/?mode={mode}"}}]]})
     elif data.startswith("take:"):
-        oid = int(data.split(":")[1])
-        f = q["from"]
-        who = (f.get("first_name", "") + " " + f.get("last_name", "")).strip() + (f" (@{f['username']})" if f.get("username") else "")
+        parts = data.split(":", 2)
+        if len(parts) < 3 or parts[2] not in MANAGERS:
+            tg("answerCallbackQuery", callback_query_id=q["id"], text="Bu tugma eskirgan", show_alert=True)
+            return
+        oid, name = int(parts[1]), parts[2]
         c = db()
-        cur = c.execute("UPDATE orders SET status='taken',taken_by=? WHERE id=? AND status='new'", (who, oid))
+        cur = c.execute("UPDATE orders SET status='taken',taken_by=? WHERE id=? AND status='new'", (name, oid))
         c.commit()
         if cur.rowcount == 1:
-            tg("answerCallbackQuery", callback_query_id=q["id"], text="Buyurtma sizga biriktirildi")
+            tg("answerCallbackQuery", callback_query_id=q["id"], text=f"Buyurtma {name}ga biriktirildi")
             tg("editMessageReplyMarkup", chat_id=cid, message_id=q["message"]["message_id"], reply_markup={"inline_keyboard": []})
-            tg("sendMessage", chat_id=cid, reply_to_message_id=q["message"]["message_id"], text=f"✅ Buyurtma #{oid} ni {who} qabul qildi.")
+            tg("sendMessage", chat_id=cid, reply_to_message_id=q["message"]["message_id"], text=f"✅ Buyurtma #{oid} ni {name} qabul qildi.")
+            o = c.execute("SELECT user_id, mode FROM orders WHERE id=?", (oid,)).fetchone()
+            if o:
+                tail = {"delivery": "U tez orada siz bilan bog'lanadi.",
+                        "pickup": "Yukingiz tayyorlab qo'yiladi, tayyor bo'lganda xabar beradi."}.get(o["mode"], "U tez orada siz bilan bog'lanadi.")
+                tg("sendMessage", chat_id=o["user_id"], text=f"👤 Buyurtmangiz #{oid} ni menejer {name} qabul qildi.\n{tail}")
         else:
-            tg("answerCallbackQuery", callback_query_id=q["id"], text="Bu buyurtmani boshqa menejer olgan", show_alert=True)
+            row = c.execute("SELECT taken_by FROM orders WHERE id=?", (oid,)).fetchone()
+            who = (row["taken_by"] if row else "") or "boshqa menejer"
+            tg("answerCallbackQuery", callback_query_id=q["id"], text=f"Bu buyurtmani {who} olgan", show_alert=True)
 
 
 @app.post(f"/webhook/{SECRET}")
@@ -124,8 +141,11 @@ def webhook():
 
 
 @app.get("/setup")
-def setup():  # brauzerda bir marta ochiladi
-    return jsonify(tg("setWebhook", url=f"{SITE_URL}/webhook/{SECRET}", allowed_updates=["message", "callback_query"]))
+def setup():  # brauzerda bir marta ochiladi (har yangilashdan keyin ham ochish mumkin)
+    r1 = tg("setWebhook", url=f"{SITE_URL}/webhook/{SECRET}", allowed_updates=["message", "callback_query"])
+    r2 = tg("setMyCommands", commands=[{"command": "start", "description": "Buyurtma berish"}], scope={"type": "all_private_chats"})
+    r3 = tg("setChatMenuButton", menu_button={"type": "commands"})
+    return jsonify(webhook=r1, menyu=r2, tugma=r3)
 
 
 def verify_init(init_data):
@@ -144,22 +164,52 @@ def verify_init(init_data):
 
 def roman(n):
     out = ""
-    for v, s in [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"), (50, "L"),
-                 (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")]:
-        while n >= v:
-            out += s
-            n -= v
-    return out
-
-
-def roman(n):
-    out = ""
     for v, s in ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"), (50, "L"),
                  (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")):
         while n >= v:
             out += s
             n -= v
     return out
+
+
+def body_lines(items, note):
+    groups = {}
+    for s, col, n, qty, inote in items:
+        groups.setdefault(f"{s} · {col}" if col else str(s), []).append((n, qty, inote))
+    lines = []
+    for g, (key, its) in enumerate(groups.items(), 1):
+        lines += ["", f"{roman(g)}. {key[:120]}"]
+        for k, (n, qty, inote) in enumerate(its, 1):
+            try:
+                qty = max(1, min(int(qty), 1000000))
+            except Exception:
+                qty = 1
+            lines.append(f"{k}) {str(n)[:150]} - {qty} ta" + (f" (izoh: {str(inote)[:150]})" if inote else ""))
+    if note:
+        lines += ["", f"💬 Izoh: {note}"]
+    return lines
+
+
+def send_lines(chat_id, lines, markup=None):
+    chunks, cur_txt = [], ""
+    for ln in lines:
+        if len(cur_txt) + len(ln) > 3500:
+            chunks.append(cur_txt)
+            cur_txt = ""
+        cur_txt += ln + "\n"
+    chunks.append(cur_txt)
+    ok = True
+    for k, ch in enumerate(chunks):
+        kw = {"chat_id": chat_id, "text": ch}
+        if markup and k == len(chunks) - 1:
+            kw["reply_markup"] = markup
+        ok = tg("sendMessage", **kw).get("ok", False) and ok
+    return ok
+
+
+def manager_keyboard(oid):
+    btns = [{"text": m, "callback_data": f"take:{oid}:{m}"} for m in MANAGERS]
+    return {"inline_keyboard": [btns[i:i + 3] for i in range(0, len(btns), 3)]}
 
 
 @app.post("/api/order")
@@ -175,7 +225,7 @@ def order():
     note = str(d.get("note") or "")[:500]
     c = db()
     u = c.execute("SELECT * FROM users WHERE id=?", (tu["id"],)).fetchone()
-    cur = c.execute("INSERT INTO orders(user_id,created) VALUES(?,?)", (tu["id"], int(time.time())))
+    cur = c.execute("INSERT INTO orders(user_id,created,mode) VALUES(?,?,?)", (tu["id"], int(time.time()), mode))
     c.commit()
     oid = cur.lastrowid
     name = (u and u["name"]) or tu.get("first_name", "")
@@ -186,39 +236,14 @@ def order():
                  "pickup": "🏬 O'ZI OLIB KETADI: yukni rasxod qilib saqlab qo'ying"}.get(mode, "Usul tanlanmagan"))
     if not (u and u["phone"]):
         head.append("⚠️ Botda to'liq ro'yxatdan o'tmagan")
-    groups = {}
-    for s, col, n, qty, inote in items:
-        groups.setdefault(f"{s} · {col}" if col else str(s), []).append((n, qty, inote))
-    lines = list(head)
-    for g, (key, its) in enumerate(groups.items(), 1):
-        lines += ["", f"{roman(g)}. {key[:120]}"]
-        for k, (n, qty, inote) in enumerate(its, 1):
-            try:
-                qty = max(1, min(int(qty), 1000000))
-            except Exception:
-                qty = 1
-            lines.append(f"{k}) {str(n)[:150]} - {qty} ta" + (f" (izoh: {str(inote)[:150]})" if inote else ""))
-    if note:
-        lines += ["", f"💬 Izoh: {note}"]
-    chunks, cur_txt = [], ""
-    for ln in lines:
-        if len(cur_txt) + len(ln) > 3500:
-            chunks.append(cur_txt)
-            cur_txt = ""
-        cur_txt += ln + "\n"
-    chunks.append(cur_txt)
-    sent = True
-    for k, ch in enumerate(chunks):
-        kw = {"chat_id": OFFICE_CHAT_ID, "text": ch}
-        if k == len(chunks) - 1:
-            kw["reply_markup"] = {"inline_keyboard": [[{"text": "✅ Men olaman", "callback_data": f"take:{oid}"}]]}
-        sent = sent and tg("sendMessage", **kw).get("ok", False)
-    if not sent:
+    body = body_lines(items, note)
+    if not send_lines(OFFICE_CHAT_ID, head + body, manager_keyboard(oid)):
         c.execute("UPDATE orders SET status='failed' WHERE id=?", (oid,))
         c.commit()
         return jsonify(ok=False, error="office"), 502
-    tg("sendMessage", chat_id=tu["id"], text=f"✅ Buyurtmangiz #{oid} qabul qilindi. " + (
-        "Menejerimiz tez orada siz bilan bog'lanadi." if mode == "delivery" else "Yukingiz tayyorlab qo'yiladi, menejerimiz xabar beradi."))
+    chead = [f"📋 Buyurtmangiz #{oid} yuborildi. Tekshirib oling!"]
+    chead.append({"delivery": "🚚 Yetkazib berish", "pickup": "🏬 O'zi olib ketaman"}.get(mode, ""))
+    send_lines(tu["id"], [x for x in chead if x] + body + ["", f"Xato yoki o'zgartirish bo'lsa, menejerlarimiz bilan bog'laning: {OFFICE_PHONE}"])
     return jsonify(ok=True, id=oid)
 
 
