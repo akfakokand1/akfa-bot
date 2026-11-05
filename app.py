@@ -1,4 +1,5 @@
 """AKFA Qo'qon Premium: sayt + buyurtma API + Telegram bot (bitta ilova)."""
+from html import escape as esc
 import os, re, json, hmac, hashlib, sqlite3, time
 from urllib.parse import parse_qsl
 import requests
@@ -178,15 +179,15 @@ def body_lines(items, note):
         groups.setdefault(f"{s} · {col}" if col else str(s), []).append((n, qty, inote))
     lines = []
     for g, (key, its) in enumerate(groups.items(), 1):
-        lines += ["", f"{roman(g)}. {key[:120]}"]
+        lines += ["", f"<b>{roman(g)}. {esc(key[:120])}</b>"]
         for k, (n, qty, inote) in enumerate(its, 1):
             try:
                 qty = max(1, min(int(qty), 1000000))
             except Exception:
                 qty = 1
-            lines.append(f"{k}) {str(n)[:150]} - {qty} ta" + (f" (izoh: {str(inote)[:150]})" if inote else ""))
+            lines.append(f"{k}) {esc(str(n)[:150])} - {qty} ta" + (f" (izoh: {esc(str(inote)[:150])})" if inote else ""))
     if note:
-        lines += ["", f"💬 Izoh: {note}"]
+        lines += ["", f"💬 Izoh: {esc(note)}"]
     return lines
 
 
@@ -200,7 +201,7 @@ def send_lines(chat_id, lines, markup=None):
     chunks.append(cur_txt)
     ok = True
     for k, ch in enumerate(chunks):
-        kw = {"chat_id": chat_id, "text": ch}
+        kw = {"chat_id": chat_id, "text": ch, "parse_mode": "HTML"}
         if markup and k == len(chunks) - 1:
             kw["reply_markup"] = markup
         ok = tg("sendMessage", **kw).get("ok", False) and ok
@@ -231,7 +232,7 @@ def order():
     name = (u and u["name"]) or tu.get("first_name", "")
     phone = (u and u["phone"]) or "-"
     un = f"@{tu['username']}" if tu.get("username") else ""
-    head = [f"🆕 Buyurtma #{oid}", f"👤 {name} {un}".strip(), f"📞 {phone}"]
+    head = [f"🆕 Buyurtma #{oid}", esc(f"👤 {name} {un}".strip()), esc(f"📞 {phone}")]
     head.append({"delivery": "🚚 YETKAZIB BERISH: menejer mijoz bilan bog'lansin",
                  "pickup": "🏬 O'ZI OLIB KETADI: yukni rasxod qilib saqlab qo'ying"}.get(mode, "Usul tanlanmagan"))
     if not (u and u["phone"]):
