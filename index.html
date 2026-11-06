@@ -95,7 +95,7 @@ function render(){
  else if(t.v==="done"){const d=el("",`<div style="text-align:center;padding:36px 10px"><svg viewBox="0 0 24 24" width="96" height="96" aria-hidden="true"><circle cx="12" cy="12" r="11" fill="#1d7a46"/><path d="M6.5 12.5l3.6 3.6 7.4-7.6" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg><h2 style="border:0;padding:0;margin:16px 0 6px;font-size:24px">Buyurtma qabul qilindi!</h2><p class="meta" style="font-size:16px">Buyurtma raqami: #${t.id}.<br>${MODE==="pickup"?"Yukingiz tayyorlab qo'yiladi, menejerimiz xabar beradi.":"Menejerimiz tez orada siz bilan bog'lanadi."}</p></div>`);
   const b=document.createElement("button");b.className="send";b.style.cssText="width:100%";b.textContent="Yangi buyurtma";b.onclick=()=>{stack=[{v:"home",f:0}];render()};d.append(b);
   if(tg){const c=document.createElement("button");c.className="sec";c.style.cssText="width:100%;margin-top:8px";c.textContent="Yopish";c.onclick=()=>tg.close();d.append(c)}v.append(d)}
- else if(t.v==="orders")ordersView(v);
+ else if(t.v==="orders")ordersView(v,t);
  else cartView(v)}
 function cartView(v){
  v.append(bar("Savat"));
@@ -119,17 +119,23 @@ async function api(path){const r=await fetch(path,{method:"POST",headers:{"Conte
 function regView(){const d=el("",'<div style="text-align:center;padding:40px 10px"><h2 style="border:0;padding:0;margin:0 0 10px;font-size:26px">Avval ro\'yxatdan o\'ting</h2><p class="meta" style="font-size:17px">Botga qaytib <b>/start</b> bosing, ism va telefon raqamingizni yuboring. Shundan keyin katalogni ochasiz.</p></div>');const b=document.createElement("button");b.className="send";b.style.cssText="width:100%";b.textContent="Botga qaytish";b.onclick=()=>tg.close();d.append(b);return d}
 const ROM=n=>{let o="";for(const[v,s]of[[1000,"M"],[900,"CM"],[500,"D"],[400,"CD"],[100,"C"],[90,"XC"],[50,"L"],[40,"XL"],[10,"X"],[9,"IX"],[5,"V"],[4,"IV"],[1,"I"]])while(n>=v){o+=s;n-=v}return o};
 const fmt=ts=>{const d=new Date(ts*1000),p=n=>String(n).padStart(2,"0");return `${p(d.getDate())}.${p(d.getMonth()+1)}.${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`};
-function ordersView(v){v.append(bar("Buyurtmalarim"));
+let ORD=null;
+const dkey=ts=>{const d=new Date(ts*1000),p=n=>String(n).padStart(2,"0");return `${p(d.getDate())}.${p(d.getMonth()+1)}.${d.getFullYear()}`};
+const tkey=ts=>{const d=new Date(ts*1000),p=n=>String(n).padStart(2,"0");return `${p(d.getHours())}:${p(d.getMinutes())}`};
+function orderCard(o){const g={};o.items.forEach(x=>{const k=x[0]+(x[1]?" · "+x[1]:"");(g[k]=g[k]||[]).push(x)});
+ let h=`<h3>Buyurtma #${o.id}</h3><div class="meta">${tkey(o.created)}${o.mode==="delivery"?" · Yetkazib berish":o.mode==="pickup"?" · O'zi olib ketadi":""}</div><div class="st">${o.taken_by?"✅ Qabul qildi: "+esc(o.taken_by):"🕓 Yuborildi, menejer qabul qilishini kuting"}</div>`;
+ Object.keys(g).forEach((k,gi)=>{h+=`<div class="gh">${ROM(gi+1)}. ${esc(k)}</div>`;g[k].forEach((x,xi)=>{h+=`<div class="ln">${xi+1}) ${esc(String(x[2]))} - ${Number(x[3])||0} ta${x[4]?" (izoh: "+esc(String(x[4]))+")":""}</div>`})});
+ if(o.note)h+=`<div class="ln">💬 ${esc(o.note)}</div>`;
+ return el("oc",h)}
+function ordersView(v,t){v.append(bar(t.d?"Buyurtmalarim · "+t.d:"Buyurtmalarim"));
  if(!(tg&&tg.initData)){v.append(el("meta","Buyurtmalar tarixi faqat Telegram ichida, bot orqali ochilganda ko'rinadi."));return}
  const box=el("","");box.append(el("meta","Yuklanmoqda..."));v.append(box);
- api("/api/my-orders").then(j=>{box.innerHTML="";if(!j.ok)throw 0;if(!j.orders.length){box.append(el("meta","Hali buyurtma bermagansiz."));return}
-  j.orders.forEach(o=>{const g={};o.items.forEach(x=>{const k=x[0]+(x[1]?" · "+x[1]:"");(g[k]=g[k]||[]).push(x)});
-   let h=`<h3>Buyurtma #${o.id}</h3><div class="meta">${fmt(o.created)}${o.mode==="delivery"?" · Yetkazib berish":o.mode==="pickup"?" · O'zi olib ketadi":""}</div><div class="st">${o.taken_by?"✅ Qabul qildi: "+esc(o.taken_by):"🕓 Yuborildi, menejer qabul qilishini kuting"}</div>`;
-   Object.keys(g).forEach((k,gi)=>{h+=`<div class="gh">${ROM(gi+1)}. ${esc(k)}</div>`;g[k].forEach((x,xi)=>{h+=`<div class="ln">${xi+1}) ${esc(String(x[2]))} - ${Number(x[3])||0} ta${x[4]?" (izoh: "+esc(String(x[4]))+")":""}</div>`})});
-   if(o.note)h+=`<div class="ln">💬 ${esc(o.note)}</div>`;
-   const c=el("oc",h);const b=document.createElement("button");b.className="sec";b.textContent="Yana shunday buyurtma";
-   b.onclick=()=>{o.items.forEach(x=>{const q=Number(x[3])||1,e=cart.find(i=>i.s===x[0]&&i.c===x[1]&&i.n===x[2]);if(e)e.qty+=q;else cart.push({s:x[0],c:x[1],n:x[2],qty:q,note:x[4]||""})});save();cnt();go({v:"cart"})};c.append(b);box.append(c)})
- }).catch(()=>{box.innerHTML="";box.append(el("meta","Yuklab bo'lmadi. Birozdan keyin qayta urinib ko'ring."))})}
+ const show=()=>{box.innerHTML="";
+  if(!ORD.length){box.append(el("meta","Hali buyurtma bermagansiz."));return}
+  if(t.d){const L=ORD.filter(o=>dkey(o.created)===t.d);if(!L.length)box.append(el("meta","Bu kunda buyurtma yo'q."));L.forEach(o=>box.append(orderCard(o)));return}
+  const days={};ORD.forEach(o=>{const k=dkey(o.created);(days[k]=days[k]||[]).push(o)});
+  const gr=el("grid");Object.keys(days).forEach(k=>{const b=document.createElement("button");b.className="card";b.innerHTML=`<div><b>${k}</b><span class="m">${days[k].length} ta buyurtma</span></div>`;b.onclick=()=>go({v:"orders",d:k});gr.append(b)});box.append(gr)};
+ api("/api/my-orders").then(j=>{if(!j.ok)throw 0;ORD=j.orders;show()}).catch(()=>{box.innerHTML="";box.append(el("meta","Yuklab bo'lmadi. Birozdan keyin qayta urinib ko'ring."))})}
 if(tg&&tg.initData){api("/api/me").then(j=>{if(j&&j.ok&&!j.registered){REG=false;render()}}).catch(()=>{})}
 cnt();render();
 </script></body></html>

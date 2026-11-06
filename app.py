@@ -1,9 +1,14 @@
 """AKFA Qo'qon Premium: sayt + buyurtma API + Telegram bot (bitta ilova)."""
-from html import escape as esc
-import os, re, json, hmac, hashlib, sqlite3, time
+from html import escape as _esc
+import os, re, json, hmac, hashlib, sqlite3, time, threading
+from datetime import datetime, timezone, timedelta
 from urllib.parse import parse_qsl
 import requests
 from flask import Flask, request, jsonify, send_from_directory
+
+def esc(s):
+    return _esc(str(s), quote=False)
+
 
 app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -17,6 +22,13 @@ DB = os.path.join(DATA_DIR, "akfa.db")
 # Buyurtmani qabul qiladigan menejerlar (tugmalarda shu ismlar chiqadi). Ismni o'zgartirish yoki qo'shish mumkin.
 MANAGERS = ["Ayubxon", "Bekzodjon", "Behzodbek", "Muhammadjon", "Umarxon", "Xolidjon"]
 OFFICE_PHONE = "+998 72 200 00 00"
+
+# Eslatmalar: ish vaqti Toshkent vaqti bilan (UTC+5). Render'da WORK_START / WORK_END o'zgaruvchilari bilan o'zgartiriladi.
+TZ = timezone(timedelta(hours=5))
+WORK_START = int(os.environ.get("WORK_START", "8"))
+WORK_END = int(os.environ.get("WORK_END", "18"))
+REMIND_AT = [5, 15, 30]  # qabul qilinmagan buyurtma uchun eslatmalar (daqiqa)
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")  # 30 daqiqadan keyin shaxsiy xabar boradigan chat
 
 
 def db():
@@ -36,6 +48,12 @@ with db() as _c:
         _c.execute("ALTER TABLE orders ADD COLUMN body TEXT")
     except sqlite3.OperationalError:
         pass
+    for _col in ("rem_count INTEGER DEFAULT 0", "rem_ids TEXT", "office_msg_id INTEGER", "dm_sent INTEGER DEFAULT 0"):
+        try:
+            _c.execute(f"ALTER TABLE orders ADD COLUMN {_col}")
+        except sqlite3.OperationalError:
+            pass
+    _c.execute("CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)")
 
 
 def tg(method, **kw):
@@ -62,6 +80,9 @@ def on_message(m):
     cid, text = chat["id"], (m.get("text") or "").strip()
     if text.split("@")[0] == "/id":  # guruh ID sini bilish uchun
         tg("sendMessage", chat_id=cid, text=f"Chat ID: {cid}")
+        return
+    if text.split("@")[0] == "/ochiq" and str(cid) == str(OFFICE_CHAT_ID):
+        send_open_list(cid)
         return
     if chat["type"] != "private":
         return
@@ -126,6 +147,7 @@ def on_callback(q):
             tg("answerCallbackQuery", callback_query_id=q["id"], text=f"Buyurtma {name}ga biriktirildi")
             tg("editMessageReplyMarkup", chat_id=cid, message_id=q["message"]["message_id"], reply_markup={"inline_keyboard": []})
             tg("sendMessage", chat_id=cid, reply_to_message_id=q["message"]["message_id"], text=f"✅ Buyurtma #{oid} ni {name} qabul qildi.")
+            delete_reminders(oid)
             o = c.execute("SELECT user_id, mode FROM orders WHERE id=?", (oid,)).fetchone()
             if o:
                 tail = {"delivery": "U tez orada siz bilan bog'lanadi.",
@@ -208,13 +230,15 @@ def send_lines(chat_id, lines, markup=None):
             cur_txt = ""
         cur_txt += ln + "\n"
     chunks.append(cur_txt)
-    ok = True
+    ok, last_id = True, None
     for k, ch in enumerate(chunks):
         kw = {"chat_id": chat_id, "text": ch, "parse_mode": "HTML"}
         if markup and k == len(chunks) - 1:
             kw["reply_markup"] = markup
-        ok = tg("sendMessage", **kw).get("ok", False) and ok
-    return ok
+        res = tg("sendMessage", **kw)
+        ok = res.get("ok", False) and ok
+        last_id = (res.get("result") or {}).get("message_id", last_id)
+    return ok, last_id
 
 
 def manager_keyboard(oid):
@@ -252,10 +276,13 @@ def order():
     if not (u and u["phone"]):
         head.append("⚠️ Botda to'liq ro'yxatdan o'tmagan")
     body = body_lines(items, note)
-    if not send_lines(OFFICE_CHAT_ID, head + body, manager_keyboard(oid)):
+    sent, office_mid = send_lines(OFFICE_CHAT_ID, head + body, manager_keyboard(oid))
+    if not sent:
         c.execute("UPDATE orders SET status='failed' WHERE id=?", (oid,))
         c.commit()
         return jsonify(ok=False, error="office"), 502
+    c.execute("UPDATE orders SET office_msg_id=? WHERE id=?", (office_mid, oid))
+    c.commit()
     chead = [f"📋 Buyurtmangiz #{oid} yuborildi. Tekshirib oling!"]
     chead.append({"delivery": "🚚 Yetkazib berish", "pickup": "🏬 O'zi olib ketaman"}.get(mode, ""))
     send_lines(tu["id"], [x for x in chead if x] + body + ["", f"Xato yoki o'zgartirish bo'lsa, menejerlarimiz bilan bog'laning: {OFFICE_PHONE}"])
@@ -279,7 +306,7 @@ def my_orders():
     if not tu:
         return jsonify(ok=False, error="auth"), 401
     rows = db().execute("SELECT id, created, mode, status, taken_by, body FROM orders "
-                        "WHERE user_id=? AND body IS NOT NULL AND status!='failed' ORDER BY id DESC LIMIT 30", (tu["id"],)).fetchall()
+                        "WHERE user_id=? AND body IS NOT NULL AND status!='failed' ORDER BY id DESC LIMIT 100", (tu["id"],)).fetchall()
     out = []
     for r in rows:
         try:
@@ -302,3 +329,103 @@ def index():
 @app.get("/health")
 def health():
     return "ok"
+
+
+# ---------------- Eslatmalar ----------------
+def wait_text(minutes):
+    m = int(minutes)
+    if m < 60:
+        return f"{m} daqiqa"
+    h, mm = divmod(m, 60)
+    if h < 24:
+        return f"{h} soat" + (f" {mm} daqiqa" if mm else "")
+    return f"{h // 24} kun"
+
+
+def untaken(c):
+    return c.execute("SELECT o.id, o.created, o.mode, o.rem_count, o.office_msg_id, o.dm_sent, u.name "
+                     "FROM orders o LEFT JOIN users u ON u.id=o.user_id "
+                     "WHERE o.status='new' AND o.body IS NOT NULL ORDER BY o.id").fetchall()
+
+
+def delete_reminders(oid):
+    c = db()
+    r = c.execute("SELECT rem_ids FROM orders WHERE id=?", (oid,)).fetchone()
+    try:
+        ids = json.loads(r["rem_ids"] or "[]") if r else []
+    except Exception:
+        ids = []
+    for mid in ids:
+        tg("deleteMessage", chat_id=OFFICE_CHAT_ID, message_id=mid)
+    c.execute("UPDATE orders SET rem_ids=NULL WHERE id=?", (oid,))
+    c.commit()
+
+
+def send_open_list(cid):
+    rows, ts = untaken(db()), time.time()
+    if not rows:
+        tg("sendMessage", chat_id=cid, text="✅ Qabul qilinmagan buyurtma yo'q.")
+        return
+    lines = [f"📋 Qabul qilinmagan buyurtmalar ({len(rows)} ta):"]
+    for r in rows:
+        mode = {"delivery": "Yetkazib berish", "pickup": "O'zi olib ketadi"}.get(r["mode"], "")
+        lines.append(f"#{r['id']} · {wait_text((ts - r['created']) / 60)} · {mode} · {r['name'] or '-'}")
+    send_lines(cid, [esc(x) for x in lines])
+
+
+def reminder_tick(now=None):
+    now = now or datetime.now(TZ)
+    if not (WORK_START <= now.hour < WORK_END):
+        return  # ish vaqtidan tashqarida eslatma yuborilmaydi
+    ts = now.timestamp()
+    work_open = now.replace(hour=WORK_START, minute=0, second=0, microsecond=0).timestamp()
+    c = db()
+    today = now.strftime("%Y-%m-%d")
+    d = c.execute("SELECT v FROM kv WHERE k='digest'").fetchone()
+    if not d or d["v"] != today:  # har kuni ish boshlanganda, bir marta
+        c.execute("INSERT INTO kv(k,v) VALUES('digest',?) ON CONFLICT(k) DO UPDATE SET v=?", (today, today))
+        c.commit()
+        old = [r for r in untaken(c) if r["created"] < work_open]
+        if old:
+            lines = [f"☀️ Ish boshlandi. Qabul qilinmagan buyurtmalar ({len(old)} ta):"]
+            lines += [f"#{r['id']} · {wait_text((ts - r['created']) / 60)} kutyapti" for r in old]
+            send_lines(OFFICE_CHAT_ID, [esc(x) for x in lines])
+    for r in untaken(c):
+        if r["created"] < work_open:
+            continue  # kechagi va tungi buyurtmalar ertalabki ro'yxatda
+        wait, n = (ts - r["created"]) / 60, (r["rem_count"] or 0)
+        if n >= len(REMIND_AT) or wait < REMIND_AT[n]:
+            continue
+        cur = c.execute("UPDATE orders SET rem_count=? WHERE id=? AND status='new' AND rem_count=?", (n + 1, r["id"], n))
+        c.commit()
+        if cur.rowcount != 1:
+            continue
+        kw = {"chat_id": OFFICE_CHAT_ID, "text": f"⏰ Buyurtma #{r['id']} hali qabul qilinmadi ({int(wait)} daqiqa). Kim oladi?"}
+        if r["office_msg_id"]:
+            kw["reply_to_message_id"] = r["office_msg_id"]
+            kw["allow_sending_without_reply"] = True
+        mid = (tg("sendMessage", **kw).get("result") or {}).get("message_id")
+        if mid:
+            row = c.execute("SELECT rem_ids, status FROM orders WHERE id=?", (r["id"],)).fetchone()
+            ids = json.loads(row["rem_ids"] or "[]") + [mid]
+            c.execute("UPDATE orders SET rem_ids=? WHERE id=?", (json.dumps(ids), r["id"]))
+            c.commit()
+            if row["status"] != "new":  # shu orada qabul qilingan bo'lsa, eslatmani darrov o'chiramiz
+                delete_reminders(r["id"])
+        if n + 1 == len(REMIND_AT) and ADMIN_CHAT_ID and not r["dm_sent"]:
+            c.execute("UPDATE orders SET dm_sent=1 WHERE id=?", (r["id"],))
+            c.commit()
+            tg("sendMessage", chat_id=ADMIN_CHAT_ID, text=f"⚠️ Buyurtma #{r['id']} {int(wait)} daqiqadan beri qabul qilinmadi.")
+
+
+def _reminder_loop():
+    while True:
+        time.sleep(60)
+        try:
+            reminder_tick()
+        except Exception as e:
+            app.logger.exception(e)
+
+
+if os.environ.get("REMINDERS", "1") == "1":
+    threading.Thread(target=_reminder_loop, daemon=True).start()
