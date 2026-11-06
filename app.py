@@ -177,7 +177,9 @@ def setup():  # brauzerda bir marta ochiladi (har yangilashdan keyin ham ochish 
     r1 = tg("setWebhook", url=f"{SITE_URL}/webhook/{SECRET}", allowed_updates=["message", "callback_query"])
     r2 = tg("setMyCommands", commands=[{"command": "start", "description": "Buyurtma berish"}], scope={"type": "all_private_chats"})
     r3 = tg("setChatMenuButton", menu_button={"type": "web_app", "text": "Katalog", "web_app": {"url": SITE_URL}})
-    return jsonify(webhook=r1, menyu=r2, tugma=r3)
+    r4 = tg("setMyCommands", commands=[{"command": "ochiq", "description": "Qabul qilinmagan buyurtmalar"}],
+            scope={"type": "chat", "chat_id": int(OFFICE_CHAT_ID)}) if OFFICE_CHAT_ID else {}
+    return jsonify(webhook=r1, menyu=r2, tugma=r3, guruh_menyu=r4)
 
 
 def verify_init(init_data):
