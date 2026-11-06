@@ -32,6 +32,10 @@ with db() as _c:
         _c.execute("ALTER TABLE orders ADD COLUMN mode TEXT")
     except sqlite3.OperationalError:
         pass
+    try:
+        _c.execute("ALTER TABLE orders ADD COLUMN body TEXT")
+    except sqlite3.OperationalError:
+        pass
 
 
 def tg(method, **kw):
@@ -48,6 +52,11 @@ def ask_mode(cid):
         [{"text": "🏬 O'zim olib ketaman", "callback_data": "mode:pickup"}]]})
 
 
+def show_catalog(cid, text="Katalogni ochish uchun pastdagi tugmani bosing. Keyingi safar chap pastdagi «Katalog» tugmasi ham bor:"):
+    tg("sendMessage", chat_id=cid, text=text,
+       reply_markup={"inline_keyboard": [[{"text": "📋 Katalogni ochish", "web_app": {"url": SITE_URL}}]]})
+
+
 def on_message(m):
     chat, uid = m["chat"], m["from"]["id"]
     cid, text = chat["id"], (m.get("text") or "").strip()
@@ -60,7 +69,7 @@ def on_message(m):
     u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
     uname = m["from"].get("username") or ""
     if text.startswith("/start") and u and u["phone"]:
-        ask_mode(cid)
+        show_catalog(cid)
         return
     if not u or text.startswith("/start"):
         c.execute("INSERT INTO users(id,step,username) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET step=?,username=?",
@@ -91,9 +100,9 @@ def on_message(m):
         c.execute("UPDATE users SET phone=?,step='done' WHERE id=?", (phone, uid))
         c.commit()
         tg("sendMessage", chat_id=cid, text="✅ Rahmat, ro'yxatdan o'tdingiz.", reply_markup={"remove_keyboard": True})
-        ask_mode(cid)
+        show_catalog(cid)
         return
-    ask_mode(cid)
+    show_catalog(cid)
 
 
 def on_callback(q):
@@ -145,7 +154,7 @@ def webhook():
 def setup():  # brauzerda bir marta ochiladi (har yangilashdan keyin ham ochish mumkin)
     r1 = tg("setWebhook", url=f"{SITE_URL}/webhook/{SECRET}", allowed_updates=["message", "callback_query"])
     r2 = tg("setMyCommands", commands=[{"command": "start", "description": "Buyurtma berish"}], scope={"type": "all_private_chats"})
-    r3 = tg("setChatMenuButton", menu_button={"type": "commands"})
+    r3 = tg("setChatMenuButton", menu_button={"type": "web_app", "text": "Katalog", "web_app": {"url": SITE_URL}})
     return jsonify(webhook=r1, menyu=r2, tugma=r3)
 
 
@@ -224,9 +233,14 @@ def order():
         return jsonify(ok=False, error="empty"), 400
     mode = d.get("mode") if d.get("mode") in ("delivery", "pickup") else ""
     note = str(d.get("note") or "")[:500]
+    if not mode:
+        return jsonify(ok=False, error="mode"), 400
     c = db()
     u = c.execute("SELECT * FROM users WHERE id=?", (tu["id"],)).fetchone()
-    cur = c.execute("INSERT INTO orders(user_id,created,mode) VALUES(?,?,?)", (tu["id"], int(time.time()), mode))
+    if not (u and u["phone"]):
+        return jsonify(ok=False, error="register"), 403
+    cur = c.execute("INSERT INTO orders(user_id,created,mode,body) VALUES(?,?,?,?)",
+                    (tu["id"], int(time.time()), mode, json.dumps({"items": items, "note": note}, ensure_ascii=False)))
     c.commit()
     oid = cur.lastrowid
     name = (u and u["name"]) or tu.get("first_name", "")
@@ -246,6 +260,36 @@ def order():
     chead.append({"delivery": "🚚 Yetkazib berish", "pickup": "🏬 O'zi olib ketaman"}.get(mode, ""))
     send_lines(tu["id"], [x for x in chead if x] + body + ["", f"Xato yoki o'zgartirish bo'lsa, menejerlarimiz bilan bog'laning: {OFFICE_PHONE}"])
     return jsonify(ok=True, id=oid)
+
+
+@app.post("/api/me")
+def me():
+    d = request.get_json(silent=True) or {}
+    tu = verify_init(d.get("initData", ""))
+    if not tu:
+        return jsonify(ok=False, error="auth"), 401
+    u = db().execute("SELECT name, phone FROM users WHERE id=?", (tu["id"],)).fetchone()
+    return jsonify(ok=True, registered=bool(u and u["phone"]), name=(u["name"] if u else ""))
+
+
+@app.post("/api/my-orders")
+def my_orders():
+    d = request.get_json(silent=True) or {}
+    tu = verify_init(d.get("initData", ""))
+    if not tu:
+        return jsonify(ok=False, error="auth"), 401
+    rows = db().execute("SELECT id, created, mode, status, taken_by, body FROM orders "
+                        "WHERE user_id=? AND body IS NOT NULL AND status!='failed' ORDER BY id DESC LIMIT 30", (tu["id"],)).fetchall()
+    out = []
+    for r in rows:
+        try:
+            b = json.loads(r["body"])
+        except Exception:
+            continue
+        out.append({"id": r["id"], "created": r["created"], "mode": r["mode"],
+                    "taken_by": (r["taken_by"] or "") if r["status"] == "taken" else "",
+                    "items": b.get("items", []), "note": b.get("note", "")})
+    return jsonify(ok=True, orders=out)
 
 
 @app.get("/")
