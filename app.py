@@ -159,6 +159,36 @@ def on_callback(q):
             tg("answerCallbackQuery", callback_query_id=q["id"], text=f"Bu buyurtmani {who} olgan", show_alert=True)
 
 
+# ---------------- Eski bot: faqat yangi botga yo'naltiradi ----------------
+OLD_BOT_TOKEN = os.environ.get("OLD_BOT_TOKEN", "")
+NEW_BOT_USERNAME = os.environ.get("NEW_BOT_USERNAME", "").lstrip("@")
+OLD_SECRET = hashlib.sha256(OLD_BOT_TOKEN.encode()).hexdigest()[:24]
+
+
+def tg_old(method, **kw):
+    try:
+        return requests.post(f"https://api.telegram.org/bot{OLD_BOT_TOKEN}/{method}", json=kw, timeout=15).json()
+    except Exception as e:
+        app.logger.error("tg_old %s: %s", method, e)
+        return {}
+
+
+@app.post(f"/old-webhook/{OLD_SECRET}")
+def old_webhook():
+    if not (OLD_BOT_TOKEN and NEW_BOT_USERNAME):
+        return "ok"
+    u = request.get_json(force=True, silent=True) or {}
+    try:
+        m = u.get("message")
+        if m and m["chat"]["type"] == "private":
+            tg_old("sendMessage", chat_id=m["chat"]["id"],
+                   text="👋 Bu eski bot. Buyurtma berish uchun AKFA Qo'qon Rasmiy Diller yangi botiga o'ting:",
+                   reply_markup={"inline_keyboard": [[{"text": "➡️ Yangi botga o'tish", "url": f"https://t.me/{NEW_BOT_USERNAME}"}]]})
+    except Exception as e:
+        app.logger.exception(e)
+    return "ok"
+
+
 @app.post(f"/webhook/{SECRET}")
 def webhook():
     u = request.get_json(force=True, silent=True) or {}
@@ -179,7 +209,12 @@ def setup():  # brauzerda bir marta ochiladi (har yangilashdan keyin ham ochish 
     r3 = tg("setChatMenuButton", menu_button={"type": "web_app", "text": "Katalog", "web_app": {"url": SITE_URL}})
     r4 = tg("setMyCommands", commands=[{"command": "ochiq", "description": "Qabul qilinmagan buyurtmalar"}],
             scope={"type": "chat", "chat_id": int(OFFICE_CHAT_ID)}) if OFFICE_CHAT_ID else {}
-    return jsonify(webhook=r1, menyu=r2, tugma=r3, guruh_menyu=r4)
+    old = {}
+    if OLD_BOT_TOKEN and NEW_BOT_USERNAME:  # eski botni yangi botga yo'naltirish
+        old = {"webhook": tg_old("setWebhook", url=f"{SITE_URL}/old-webhook/{OLD_SECRET}", allowed_updates=["message"]),
+               "tugma": tg_old("setChatMenuButton", menu_button={"type": "default"}),
+               "menyu": tg_old("setMyCommands", commands=[{"command": "start", "description": "Yangi botga o'tish"}])}
+    return jsonify(webhook=r1, menyu=r2, tugma=r3, guruh_menyu=r4, eski_bot=old)
 
 
 def verify_init(init_data):
