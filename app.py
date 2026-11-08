@@ -148,6 +148,7 @@ def on_callback(q):
             tg("editMessageReplyMarkup", chat_id=cid, message_id=q["message"]["message_id"], reply_markup={"inline_keyboard": []})
             tg("sendMessage", chat_id=cid, reply_to_message_id=q["message"]["message_id"], text=f"✅ Buyurtma #{oid} ni {name} qabul qildi.")
             delete_reminders(oid)
+            sync_general()
             o = c.execute("SELECT user_id, mode FROM orders WHERE id=?", (oid,)).fetchone()
             if o:
                 tail = {"delivery": "U tez orada siz bilan bog'lanadi.",
@@ -267,15 +268,16 @@ def send_lines(chat_id, lines, markup=None):
             cur_txt = ""
         cur_txt += ln + "\n"
     chunks.append(cur_txt)
-    ok, last_id = True, None
+    ok, first_id = True, None
     for k, ch in enumerate(chunks):
         kw = {"chat_id": chat_id, "text": ch, "parse_mode": "HTML"}
         if markup and k == len(chunks) - 1:
             kw["reply_markup"] = markup
         res = tg("sendMessage", **kw)
         ok = res.get("ok", False) and ok
-        last_id = (res.get("result") or {}).get("message_id", last_id)
-    return ok, last_id
+        if first_id is None:
+            first_id = (res.get("result") or {}).get("message_id")
+    return ok, first_id
 
 
 def manager_keyboard(oid):
@@ -369,6 +371,14 @@ def health():
 
 
 # ---------------- Eslatmalar ----------------
+def order_ref(r):
+    """#13 ni guruhdagi buyurtma xabariga olib boradigan havola (superguruhlarda)."""
+    cid = str(OFFICE_CHAT_ID)
+    if r["office_msg_id"] and cid.startswith("-100"):
+        return f'<a href="https://t.me/c/{cid[4:]}/{r["office_msg_id"]}">#{r["id"]}</a>'
+    return f'#{r["id"]}'
+
+
 def wait_text(minutes):
     m = int(minutes)
     if m < 60:
@@ -406,8 +416,62 @@ def send_open_list(cid):
     lines = [f"📋 Qabul qilinmagan buyurtmalar ({len(rows)} ta):"]
     for r in rows:
         mode = {"delivery": "Yetkazib berish", "pickup": "O'zi olib ketadi"}.get(r["mode"], "")
-        lines.append(f"#{r['id']} · {wait_text((ts - r['created']) / 60)} · {mode} · {r['name'] or '-'}")
-    send_lines(cid, [esc(x) for x in lines])
+        lines.append(f"{order_ref(r)} · {esc(wait_text((ts - r['created']) / 60))} · {esc(mode)} · {esc(r['name'] or '-')}")
+    send_lines(cid, [esc(lines[0])] + lines[1:])
+
+
+GEN_EVERY = 10  # umumiy eslatma har necha daqiqada yangilanadi
+
+
+def kv_get(c, k):
+    r = c.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+    return r["v"] if r else None
+
+
+def kv_set(c, k, v):
+    if v is None:
+        c.execute("DELETE FROM kv WHERE k=?", (k,))
+    else:
+        c.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=?", (k, str(v), str(v)))
+    c.commit()
+
+
+def work_open_ts(now):
+    o = now.replace(hour=WORK_START, minute=0, second=0, microsecond=0)
+    if now < o:
+        o -= timedelta(days=1)
+    return o.timestamp()
+
+
+def sync_general(now=None, send_new=False):
+    """Bitta umumiy eslatma: 2 va undan ko'p buyurtma qabul qilinmagan bo'lsa turadi, qolmasa o'chadi."""
+    now = now or datetime.now(TZ)
+    ts, wo = now.timestamp(), work_open_ts(now)
+    c = db()
+    rows = [r for r in untaken(c) if (ts - max(r["created"], wo)) / 60 >= REMIND_AT[0]]
+    gid = kv_get(c, "gen_msg")
+    if len(rows) < 2:
+        if gid:
+            tg("deleteMessage", chat_id=OFFICE_CHAT_ID, message_id=int(gid))
+            kv_set(c, "gen_msg", None)
+        return
+    lines = [esc(f"⏰ Qabul qilinmagan buyurtmalar ({len(rows)} ta). Kim oladi?")]
+    for r in rows:
+        mode = {"delivery": "Yetkazib berish", "pickup": "O'zi olib ketadi"}.get(r["mode"], "")
+        lines.append(f"{order_ref(r)} · {esc(wait_text((ts - r['created']) / 60))} · {esc(mode)} · {esc(r['name'] or '-')}")
+    text = "\n".join(lines)
+    if not send_new:  # buyurtma qabul qilinganda: ro'yxatni joyida yangilaymiz
+        if gid:
+            tg("editMessageText", chat_id=OFFICE_CHAT_ID, message_id=int(gid), text=text, parse_mode="HTML")
+        return
+    last = kv_get(c, "gen_last")
+    if gid and last and ts - float(last) < GEN_EVERY * 60:
+        return
+    if gid:
+        tg("deleteMessage", chat_id=OFFICE_CHAT_ID, message_id=int(gid))
+    mid = (tg("sendMessage", chat_id=OFFICE_CHAT_ID, text=text, parse_mode="HTML").get("result") or {}).get("message_id")
+    kv_set(c, "gen_msg", mid)
+    kv_set(c, "gen_last", ts)
 
 
 def reminder_tick(now=None):
@@ -425,8 +489,8 @@ def reminder_tick(now=None):
         old = [r for r in untaken(c) if r["created"] < work_open]
         if old:
             lines = [f"☀️ Ish boshlandi. Qabul qilinmagan buyurtmalar ({len(old)} ta):"]
-            lines += [f"#{r['id']} · {wait_text((ts - r['created']) / 60)} kutyapti" for r in old]
-            send_lines(OFFICE_CHAT_ID, [esc(x) for x in lines])
+            lines = [esc(lines[0])] + [f"{order_ref(r)} · {esc(wait_text((ts - r['created']) / 60))} kutyapti" for r in old]
+            send_lines(OFFICE_CHAT_ID, lines)
     for r in untaken(c):
         if r["created"] < work_open:
             continue  # kechagi va tungi buyurtmalar ertalabki ro'yxatda
@@ -437,15 +501,18 @@ def reminder_tick(now=None):
         c.commit()
         if cur.rowcount != 1:
             continue
-        kw = {"chat_id": OFFICE_CHAT_ID, "text": f"⏰ Buyurtma #{r['id']} hali qabul qilinmadi ({int(wait)} daqiqa). Kim oladi?"}
+        who = f" ({esc(r['name'])})" if r["name"] else ""
+        kw = {"chat_id": OFFICE_CHAT_ID, "parse_mode": "HTML",
+              "text": f"⏰ Buyurtma #{r['id']}{who} hali qabul qilinmadi ({int(wait)} daqiqa). Kim oladi?"}
         if r["office_msg_id"]:
             kw["reply_to_message_id"] = r["office_msg_id"]
             kw["allow_sending_without_reply"] = True
         mid = (tg("sendMessage", **kw).get("result") or {}).get("message_id")
         if mid:
             row = c.execute("SELECT rem_ids, status FROM orders WHERE id=?", (r["id"],)).fetchone()
-            ids = json.loads(row["rem_ids"] or "[]") + [mid]
-            c.execute("UPDATE orders SET rem_ids=? WHERE id=?", (json.dumps(ids), r["id"]))
+            for old_mid in json.loads(row["rem_ids"] or "[]"):  # shu buyurtmaning oldingi eslatmasi o'chadi
+                tg("deleteMessage", chat_id=OFFICE_CHAT_ID, message_id=old_mid)
+            c.execute("UPDATE orders SET rem_ids=? WHERE id=?", (json.dumps([mid]), r["id"]))
             c.commit()
             if row["status"] != "new":  # shu orada qabul qilingan bo'lsa, eslatmani darrov o'chiramiz
                 delete_reminders(r["id"])
@@ -453,6 +520,7 @@ def reminder_tick(now=None):
             c.execute("UPDATE orders SET dm_sent=1 WHERE id=?", (r["id"],))
             c.commit()
             tg("sendMessage", chat_id=ADMIN_CHAT_ID, text=f"⚠️ Buyurtma #{r['id']} {int(wait)} daqiqadan beri qabul qilinmadi.")
+    sync_general(now, send_new=True)
 
 
 def _reminder_loop():
