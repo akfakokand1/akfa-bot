@@ -608,10 +608,11 @@ def reminder_tick(now=None):
             c.commit()
             if row["status"] != "new":  # shu orada qabul qilingan bo'lsa, eslatmani darrov o'chiramiz
                 delete_reminders(r["id"])
-        if n + 1 == len(REMIND_AT) and ADMIN_CHAT_ID and not r["dm_sent"]:
+        if n + 1 == len(REMIND_AT) and ADMINS and not r["dm_sent"]:
             c.execute("UPDATE orders SET dm_sent=1 WHERE id=?", (r["id"],))
             c.commit()
-            tg("sendMessage", chat_id=ADMIN_CHAT_ID, text=f"⚠️ Buyurtma #{r['id']} {int(wait)} daqiqadan beri qabul qilinmadi.")
+            for adm in ADMINS:  # barcha adminlarga shaxsiy xabar
+                tg("sendMessage", chat_id=adm, text=f"⚠️ Buyurtma #{r['id']} {int(wait)} daqiqadan beri qabul qilinmadi.")
     sync_general(now, send_new=True)
 
 
