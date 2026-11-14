@@ -29,6 +29,9 @@ WORK_START = int(os.environ.get("WORK_START", "8"))
 WORK_END = int(os.environ.get("WORK_END", "18"))
 REMIND_AT = [5, 15, 30]  # qabul qilinmagan buyurtma uchun eslatmalar (daqiqa)
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")  # 30 daqiqadan keyin shaxsiy xabar boradigan chat
+# Statistikani ko'ra oladigan adminlar: ADMIN_IDS (vergul bilan) va ADMIN_CHAT_ID dagi Telegram ID lar
+ADMINS = sorted({int(x) for x in (os.environ.get("ADMIN_IDS", "") + "," + ADMIN_CHAT_ID).replace(" ", "").split(",")
+                 if x.lstrip("-").isdigit()})
 
 
 def db():
@@ -48,7 +51,7 @@ with db() as _c:
         _c.execute("ALTER TABLE orders ADD COLUMN body TEXT")
     except sqlite3.OperationalError:
         pass
-    for _col in ("rem_count INTEGER DEFAULT 0", "rem_ids TEXT", "office_msg_id INTEGER", "dm_sent INTEGER DEFAULT 0"):
+    for _col in ("rem_count INTEGER DEFAULT 0", "rem_ids TEXT", "office_msg_id INTEGER", "dm_sent INTEGER DEFAULT 0", "taken_at INTEGER"):
         try:
             _c.execute(f"ALTER TABLE orders ADD COLUMN {_col}")
         except sqlite3.OperationalError:
@@ -85,6 +88,13 @@ def on_message(m):
         send_open_list(cid)
         return
     if chat["type"] != "private":
+        return
+    if text.split("@")[0] == "/statistika":
+        if uid in ADMINS:
+            t, kb = build_stats("month")
+            tg("sendMessage", chat_id=cid, text=t, parse_mode="HTML", reply_markup=kb)
+        else:
+            tg("sendMessage", chat_id=cid, text="Bu buyruq faqat admin uchun.")
         return
     c = db()
     u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
@@ -134,6 +144,13 @@ def on_callback(q):
         label = "Yetkazib berish" if mode == "delivery" else "O'zi olib ketish"
         tg("sendMessage", chat_id=cid, text=f"{label} tanlandi. Katalogni oching, tovarlarni savatga yig'ing va buyurtmani yuboring:",
            reply_markup={"inline_keyboard": [[{"text": "📋 Katalogni ochish", "web_app": {"url": f"{SITE_URL}/?mode={mode}"}}]]})
+    elif data.startswith("stat:"):
+        if q["from"]["id"] not in ADMINS:
+            tg("answerCallbackQuery", callback_query_id=q["id"], text="Faqat admin uchun", show_alert=True)
+            return
+        t, kb = build_stats(data.split(":", 1)[1])
+        tg("answerCallbackQuery", callback_query_id=q["id"])
+        tg("editMessageText", chat_id=cid, message_id=q["message"]["message_id"], text=t, parse_mode="HTML", reply_markup=kb)
     elif data.startswith("take:"):
         parts = data.split(":", 2)
         if len(parts) < 3 or parts[2] not in MANAGERS:
@@ -141,7 +158,7 @@ def on_callback(q):
             return
         oid, name = int(parts[1]), parts[2]
         c = db()
-        cur = c.execute("UPDATE orders SET status='taken',taken_by=? WHERE id=? AND status='new'", (name, oid))
+        cur = c.execute("UPDATE orders SET status='taken',taken_by=?,taken_at=? WHERE id=? AND status='new'", (name, int(time.time()), oid))
         c.commit()
         if cur.rowcount == 1:
             tg("answerCallbackQuery", callback_query_id=q["id"], text=f"Buyurtma {name}ga biriktirildi")
@@ -215,7 +232,10 @@ def setup():  # brauzerda bir marta ochiladi (har yangilashdan keyin ham ochish 
         old = {"webhook": tg_old("setWebhook", url=f"{SITE_URL}/old-webhook/{OLD_SECRET}", allowed_updates=["message"]),
                "tugma": tg_old("setChatMenuButton", menu_button={"type": "default"}),
                "menyu": tg_old("setMyCommands", commands=[{"command": "start", "description": "Yangi botga o'tish"}])}
-    return jsonify(webhook=r1, menyu=r2, tugma=r3, guruh_menyu=r4, eski_bot=old)
+    adm = [tg("setMyCommands", commands=[{"command": "start", "description": "Buyurtma berish"},
+                                         {"command": "statistika", "description": "Statistika (admin)"}],
+              scope={"type": "chat", "chat_id": a}) for a in ADMINS]
+    return jsonify(webhook=r1, menyu=r2, tugma=r3, guruh_menyu=r4, admin_menyu=adm, eski_bot=old)
 
 
 def verify_init(init_data):
@@ -368,6 +388,78 @@ def index():
 @app.get("/health")
 def health():
     return "ok"
+
+
+# ---------------- Statistika (admin) ----------------
+STAT_PERIODS = [("day", "Bugun"), ("month", "Shu oy"), ("prev", "O'tgan oy"), ("all", "Umumiy")]
+
+
+def stat_range(p, now):
+    d0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    m0 = d0.replace(day=1)
+    if p == "day":
+        return d0.timestamp(), None, f"Bugun ({d0:%d.%m.%Y})"
+    if p == "prev":
+        pm = (m0 - timedelta(days=1)).replace(day=1)
+        return pm.timestamp(), m0.timestamp(), f"O'tgan oy ({pm:%m.%Y})"
+    if p == "all":
+        return 0, None, "Umumiy (boshidan beri)"
+    return m0.timestamp(), None, f"Shu oy ({m0:%d.%m}-{now:%d.%m.%Y})"
+
+
+def top_lines(pairs, n=5):
+    return [f"{i}. {esc(k)} - <b>{v}</b> ta" for i, (k, v) in enumerate(pairs[:n], 1)]
+
+
+def build_stats(period, now=None):
+    now = now or datetime.now(TZ)
+    if period not in dict(STAT_PERIODS):
+        period = "month"
+    start, end, label = stat_range(period, now)
+    c = db()
+    rows = c.execute("SELECT o.id, o.created, o.mode, o.status, o.taken_by, o.taken_at, o.body, o.user_id, u.name, u.username "
+                     "FROM orders o LEFT JOIN users u ON u.id=o.user_id "
+                     "WHERE o.body IS NOT NULL AND o.status!='failed' AND o.created>=? AND (? IS NULL OR o.created<?)",
+                     (start, end, end)).fetchall()
+    regs = c.execute("SELECT COUNT(*) n FROM users WHERE phone IS NOT NULL").fetchone()["n"]
+    lines = [f"<b>📊 Statistika · {esc(label)}</b>", ""]
+    if not rows:
+        lines.append("Bu davrda buyurtma yo'q.")
+    else:
+        taken = [r for r in rows if r["status"] == "taken"]
+        new = len(rows) - len(taken)
+        dl = sum(1 for r in rows if r["mode"] == "delivery")
+        lines += [f"Buyurtmalar: <b>{len(rows)}</b> ta",
+                  f"✅ Qabul qilingan: {len(taken)} · ⏳ Kutilmoqda: {new}",
+                  f"🚚 Yetkazib berish: {dl} · 🏬 O'zi olib ketadi: {sum(1 for r in rows if r['mode'] == 'pickup')}"]
+        waits = sorted((r["taken_at"] - r["created"]) / 60 for r in taken if r["taken_at"] and r["taken_at"] >= r["created"])
+        if waits:
+            lines.append(f"⏱ Odatda {esc(wait_text(waits[len(waits) // 2]))} ichida qabul qilinadi")
+        mg = {}
+        for m in MANAGERS:
+            mg[m] = 0
+        for r in taken:
+            mg[r["taken_by"] or "?"] = mg.get(r["taken_by"] or "?", 0) + 1
+        lines += ["", "<b>👤 Menejerlar (qabul qilgan)</b>"] + top_lines(sorted(mg.items(), key=lambda x: -x[1]), 20)
+        cu = {}
+        for r in rows:
+            k = r["name"] or (("@" + r["username"]) if r["username"] else str(r["user_id"]))
+            cu[k] = cu.get(k, 0) + 1
+        lines += ["", f"<b>🏆 Eng faol mijozlar</b> (buyurtma bergan: {len(cu)} ta)"] + top_lines(sorted(cu.items(), key=lambda x: -x[1]))
+        it = {}
+        for r in rows:
+            try:
+                for s_, col, n, qty, _ in json.loads(r["body"]).get("items", []):
+                    k = f"{n} ({col})" if col else str(n)
+                    it[k] = it.get(k, 0) + max(1, min(int(qty), 1000000))
+            except Exception:
+                continue
+        if it:
+            lines += ["", "<b>🔥 Eng ko'p buyurtma qilingan tovarlar</b>"] + top_lines(sorted(it.items(), key=lambda x: -x[1]))
+    lines += ["", f"Ro'yxatdan o'tgan mijozlar (jami): {regs} ta"]
+    kb = [[{"text": ("• " if k == period else "") + v, "callback_data": f"stat:{k}"} for k, v in STAT_PERIODS[i:i + 2]]
+          for i in (0, 2)]
+    return "\n".join(lines), {"inline_keyboard": kb}
 
 
 # ---------------- Eslatmalar ----------------
